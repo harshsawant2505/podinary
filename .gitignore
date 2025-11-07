@@ -1,0 +1,94 @@
+# ==========================================================
+# Python & Flask project ignores
+# ==========================================================
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.env
+.venv/
+venv/
+ENV/
+env/
+env.bak/
+env*/              
+
+# Environment variables
+*.env
+.env.*
+!example.env        # keep a sample env if you want to share variable structure
+
+# Flask / instance files
+instance/
+*.db
+*.sqlite3
+*.log
+*.pid
+
+# Configs / credentials
+cookies.txt
+*.pem
+*.key
+*.crt
+*.p12
+*.json
+secrets/
+private_keys/
+keys/
+.DS_Store
+
+# Caches
+*.cache
+*.bak
+*.swp
+__pypackages__/
+.cache/
+.pytest_cache/
+.mypy_cache/
+coverage/
+htmlcov/
+
+# Build outputs
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# IDE / Editor
+.vscode/
+.idea/
+*.code-workspace
+
+# Misc
+*.zip
+*.tar
+*.tar.gz
+*.gz
+*.tmp
+
+# OS-specific
+Thumbs.db
+.DS_Store
+ehthumbs.db
+Icon?
+
+# ==========================================================
+# Node/Next.js (if front-end present in same repo)
+# ==========================================================
+node_modules/
+.next/
+out/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ==========================================================
+# Logs / runtime artifacts
+# ==========================================================
+*.log
+*.out
+*.pid
+nohup.out

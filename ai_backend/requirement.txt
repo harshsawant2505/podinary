@@ -1,0 +1,10 @@
+Flask
+Flask-Cors
+langchain
+langchain-groq
+langgraph
+google-api-python-client
+httplib2
+yt-dlp
+python-dotenv
+gunicorn
