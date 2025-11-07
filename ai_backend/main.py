@@ -1,17 +1,22 @@
 import os
+import json
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from langchain_groq import ChatGroq
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import StateGraph, END
 from typing import TypedDict, List
-import json
 from youtube_transcript_api import YouTubeTranscriptApi
+from tavily import TavilyClient
+
 
 class AgentState(TypedDict):
     transcript_text: str
     transcript_snippets: List[dict]
-    explanations: List[dict]
+    vocab_explanations: List[dict]
+    context_entities: List[dict]
+
+tavily = TavilyClient(api_key=os.environ.get("TAVILY_API_KEY"))
 
 def find_and_explain_words(state: AgentState):
     print("--- NODE: find_and_explain_words ---")
@@ -22,7 +27,7 @@ def find_and_explain_words(state: AgentState):
         api_key = os.environ.get("GROQ_API_KEY")
         if not api_key:
             print("Error: GROQ_API_KEY not set.")
-            return {"explanations": []}
+            return {"vocab_explanations": [], "context_entities": []}
 
         llm = ChatGroq(
             model="llama-3.1-8b-instant",
@@ -32,9 +37,9 @@ def find_and_explain_words(state: AgentState):
         json_llm = llm.bind(response_format={"type": "json_object"})
     except Exception as e:
         print(f"Error initializing Groq LLM: {e}")
-        return {"explanations": []}
+        return {"vocab_explanations": [], "context_entities": []}
 
-    system_prompt = """
+    vocab_prompt = """
     You are an expert lexicographer and linguist. A user has provided a video transcript.
     Identify ONLY genuinely difficult, uncommon, or technical English words.
 
@@ -54,52 +59,91 @@ def find_and_explain_words(state: AgentState):
         }
       ]
     }
-
-    Guidelines:
-    - Provide 2–4 short synonyms or simpler equivalents in "synonyms".
-    - If no synonyms exist, return an empty array.
-    - If no valid difficult words are found, return {"explanations": []}.
     """
 
     messages = [
-        SystemMessage(content=system_prompt),
-        HumanMessage(
-            content=f"Transcript:\n\n{full_transcript}\n\nIdentify difficult or technical words with their meanings and synonyms."
-        )
+        SystemMessage(content=vocab_prompt),
+        HumanMessage(content=f"Transcript:\n\n{full_transcript}\n\nIdentify difficult words and synonyms.")
     ]
 
     try:
         response = json_llm.invoke(messages)
-        response_data = json.loads(response.content)
-        explanations = response_data.get("explanations", [])
-
-        explanations_with_timestamps = []
-        for explanation in explanations:
-            term = explanation.get("term", "").lower().strip()
-            if not term:
-                continue
-
-            timestamp = None
-            for snippet in transcript_snippets:
-                snippet_text = snippet["text"].lower()
-                if term in snippet_text.split():
-                    timestamp = snippet["start"]
-                    break
-
-            if timestamp is not None:
-                explanations_with_timestamps.append({
-                    "term": explanation.get("term"),
-                    "explanation": explanation.get("explanation"),
-                    "synonyms": explanation.get("synonyms", []),
-                    "timestamp": round(timestamp, 2)
-                })
-
-        print(f"Generated explanations: {json.dumps(explanations_with_timestamps, indent=2)}")
-        return {"explanations": explanations_with_timestamps}
-
+        vocab_data = json.loads(response.content)
+        vocab_explanations = vocab_data.get("explanations", [])
     except Exception as e:
-        print(f"Error calling LLM or parsing JSON: {e}")
-        return {"explanations": []}
+        print(f"[Error in vocab extraction] {e}")
+        vocab_explanations = []
+
+    vocab_with_timestamps = []
+    for item in vocab_explanations:
+        term = item.get("term", "").lower().strip()
+        if not term:
+            continue
+        timestamp = None
+        for snippet in transcript_snippets:
+            if term in snippet["text"].lower().split():
+                timestamp = snippet["start"]
+                break
+        if timestamp is not None:
+            vocab_with_timestamps.append({
+                "term": item.get("term"),
+                "explanation": item.get("explanation"),
+                "synonyms": item.get("synonyms", []),
+                "timestamp": round(timestamp, 2)
+            })
+
+    context_prompt = """
+    You are a historical context identifier.
+    From the following transcript, identify up to 5 named entities that represent
+    major historical figures, events, scientific discoveries, wars, organizations, or significant topics.
+
+    For each entity, return this JSON format:
+    {
+      "context_entities": [
+        {
+          "entity": "string",
+          "type": "person | event | organization | concept",
+          "timestamp": number
+        }
+      ]
+    }
+    """
+
+    context_messages = [
+        SystemMessage(content=context_prompt),
+        HumanMessage(content=f"Transcript:\n\n{full_transcript}\n\nList historical entities and topics mentioned.")
+    ]
+
+    try:
+        context_response = json_llm.invoke(context_messages)
+        context_data = json.loads(context_response.content)
+        context_entities = context_data.get("context_entities", [])
+    except Exception as e:
+        print(f"[Error extracting entities] {e}")
+        context_entities = []
+
+    enriched_context = []
+    for ent in context_entities:
+        name = ent.get("entity")
+        if not name:
+            continue
+        try:
+            search_result = tavily.search(name, max_results=1, include_answer=True)
+            summary = search_result.get("results", [{}])[0].get("answer", "No information found.")
+        except Exception as e:
+            summary = f"Error fetching info: {e}"
+        enriched_context.append({
+            "entity": name,
+            "type": ent.get("type", "unknown"),
+            "summary": summary,
+            "timestamp": round(ent.get("timestamp", 0), 2)
+        })
+
+    print(f"✅ Generated Vocab: {len(vocab_with_timestamps)} | Context: {len(enriched_context)}")
+    return {
+        "vocab_explanations": vocab_with_timestamps,
+        "context_entities": enriched_context
+    }
 
 workflow = StateGraph(AgentState)
 workflow.add_node("find_and_explain_words", find_and_explain_words)
@@ -108,7 +152,7 @@ workflow.add_edge("find_and_explain_words", END)
 app_agent = workflow.compile()
 
 app = Flask(__name__)
-CORS(app)
+CORS(app, resources={r"/*": {"origins": "*"}})
 
 def get_youtube_transcript(video_id):
     try:
@@ -116,101 +160,46 @@ def get_youtube_transcript(video_id):
         fetched_transcript = api.fetch(video_id, languages=['en'])
         snippets = fetched_transcript.snippets
 
-        full_transcript_text = ""
+        text = ""
         snippets_list = []
+        for s in snippets:
+            text += s.text + " "
+            snippets_list.append({"text": s.text, "start": s.start, "duration": s.duration})
 
-        for snippet in snippets:
-            full_transcript_text += snippet.text + " "
-            snippets_list.append({
-                "text": snippet.text,
-                "start": snippet.start,
-                "duration": snippet.duration
-            })
-
-        transcript = full_transcript_text.strip()
-
-        if not transcript:
-            return False, {"error": "Transcript was found but empty.", "code": 500}
-
-        return True, (transcript, snippets_list)
-
+        return True, (text.strip(), snippets_list)
     except Exception as e:
-        error_msg = str(e).lower()
-        if 'transcript' in error_msg and 'disabled' in error_msg:
-            return False, {"error": "Transcripts are disabled for this video.", "code": 403}
-        elif 'no transcript' in error_msg:
-            return False, {"error": "No transcript available for this video.", "code": 404}
-        elif 'video unavailable' in error_msg:
-            return False, {"error": "Video is unavailable or does not exist.", "code": 404}
-        else:
-            return False, {"error": f"Error fetching transcript: {str(e)}", "code": 500}
+        return False, {"error": str(e), "code": 500}
 
 @app.route('/explain', methods=['POST'])
 def explain():
     data = request.json
-    video_id = data.get('youtube_id')
-    start_time_str = data.get('start_time')
-    end_time_str = data.get('end_time')
+    video_id = data.get("youtube_id")
+    start = float(data.get("start_time", 0))
+    end = float(data.get("end_time", 0))
 
-    GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
-
-    if not video_id:
-        return jsonify({"error": "No 'youtube_id' provided"}), 400
-    if start_time_str is None or end_time_str is None:
-        return jsonify({"error": "Missing start_time or end_time"}), 400
-
-    try:
-        start_time = float(start_time_str)
-        end_time = float(end_time_str)
-    except ValueError:
-        return jsonify({"error": "'start_time' and 'end_time' must be numbers"}), 400
-
-    if not GROQ_API_KEY:
-        print("Error: GROQ_API_KEY not set.")
-        return jsonify({"error": "Backend missing GROQ_API_KEY"}), 500
-
-    print(f"\n--- New Request ---\nVideo: {video_id}, Start: {start_time}, End: {end_time}")
+    print(f"\n--- New Request ---\nVideo: {video_id}, Start: {start}, End: {end}")
 
     success, result = get_youtube_transcript(video_id)
     if not success:
-        print(f"Transcript fetch failed: {result['error']}")
-        return jsonify({"error": result['error']}), result['code']
+        return jsonify(result), result.get("code", 500)
 
-    all_transcript_text, all_snippets = result
+    full_text, all_snippets = result
 
-    filtered_snippets = []
-    filtered_text_builder = []
-    for snippet in all_snippets:
-        snippet_start = snippet['start']
-        snippet_end = snippet_start + snippet['duration']
-        if snippet_start < end_time and snippet_end > start_time:
-            filtered_snippets.append(snippet)
-            filtered_text_builder.append(snippet['text'])
+    filtered_snippets = [s for s in all_snippets if s["start"] < end and (s["start"] + s["duration"]) > start]
+    filtered_text = " ".join([s["text"] for s in filtered_snippets]).strip()
 
-    filtered_full_text = " ".join(filtered_text_builder).strip()
-    if not filtered_full_text:
-        print("No transcript found in specified range.")
-        return jsonify([])
+    if not filtered_text:
+        return jsonify({"error": "No transcript text found in given time range"}), 404
 
-    print("--- Filtered Transcript (first 500 chars) ---")
-    print(filtered_full_text[:500])
-    print("---------------------------------------------")
-
-    inputs = {
-        "transcript_text": filtered_full_text,
-        "transcript_snippets": filtered_snippets
-    }
+    inputs = {"transcript_text": filtered_text, "transcript_snippets": filtered_snippets}
     final_state = app_agent.invoke(inputs)
-    explanations = final_state.get("explanations", [])
-
-    print(f"Sending explanations: {json.dumps(explanations, indent=2)}")
-    return jsonify(explanations)
+    return jsonify(final_state)
 
 @app.route('/health', methods=['GET'])
 def health_check():
     return jsonify({"status": "ok", "message": "Server is running"}), 200
 
 if __name__ == '__main__':
-    print("Starting Flask server on http://127.0.0.1:5000")
-    print("Ensure GROQ_API_KEY environment variable is set.")
+    print("🚀 Starting Flask server on http://127.0.0.1:5000")
+    print("Ensure GROQ_API_KEY and TAVILY_API_KEY are set.")
     app.run(debug=True, port=5000)
